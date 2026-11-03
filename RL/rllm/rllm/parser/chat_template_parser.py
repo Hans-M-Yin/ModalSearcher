@@ -1,0 +1,931 @@
+import json
+import logging
+import os
+import re
+from copy import deepcopy
+
+import torch
+
+from rllm.tools.tool_base import Tool, ToolCall, ToolOutput
+from synthesis.sft.qwen3_vl_template import (
+    IMAGE_PLACEHOLDER,
+    format_sft_qwen_tool_prompt,
+)
+
+from .utils import PARSER_TEST_MESSAGES
+
+logger = logging.getLogger(__name__)
+
+
+class ChatTemplateParser:
+    def __init__(self, tokenizer, processor=None):
+        self.tokenizer = tokenizer
+        self.processor = processor
+        self.generation_prompt = self._get_generation_prompt(tokenizer)
+
+    def _get_generation_prompt(self, tokenizer):
+        messages = [{"role": "assistant", "content": ""}]
+
+        with_prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+        without_prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=False, tokenize=False)
+
+        generation_prompt = with_prompt[len(without_prompt) :]
+
+        return generation_prompt
+
+    def parse(self, messages, add_generation_prompt=False, is_first_msg=False, **kwargs) -> str:
+        if self.processor is not None:
+            return self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
+        else:
+            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt)
+
+    def parse_completion(self, completion_ids: list[int]):
+        raise NotImplementedError("ChatTemplateParser does not support parse_completion")
+
+    def verify_equivalence(self, messages, verbose=True):
+        """Verify that parsing messages together is equivalent to parsing them individually.
+
+        Args:
+            messages (list): List of message dictionaries to test
+            verbose (bool): Whether to print detailed information about the test
+
+        Returns:
+            bool: True if the equivalence check passes, False otherwise
+
+        Raises:
+            AssertionError: If the equivalence check fails and verbose is True
+        """
+        # Parse all messages together
+        batch_result = self.parse(messages)
+
+        # Parse each message individually and concatenate
+        individual_results = []
+        for message in messages:
+            individual_results.append(self.parse([message]))
+
+        concatenated_result = "".join(individual_results)
+
+        # Check if results are equivalent
+        is_equivalent = batch_result == concatenated_result
+
+        if verbose and not is_equivalent:
+            print("Equivalence check failed!")
+            print("Batch parsing result:")
+            print(batch_result)
+            print("\nConcatenated individual parsing result:")
+            print(concatenated_result)
+            raise AssertionError("Parser failed equivalence check. See above for details.")
+
+        return is_equivalent
+
+    @classmethod
+    def get_parser(cls, tokenizer, processor=None, disable_thinking=False) -> "ChatTemplateParser":
+        """Factory method to get the appropriate parser based on a string identifier.
+
+        Args:
+            parser_type (str): String identifier for the parser type
+            tokenizer: The tokenizer to use with the parser
+            disable_thinking: Whether generation prompt will disable thinking.
+
+        Returns:
+            ChatTemplateParser: An instance of the requested parser
+
+        Raises:
+            ValueError: If the parser_type is not recognized
+        """
+        # Determine parser type based on tokenizer name or path
+        if isinstance(tokenizer.name_or_path, str):
+            model_name = tokenizer.name_or_path.lower()
+            tokenizer_cls = tokenizer.__class__.__name__.lower()
+            logger.info(f"model_name: {model_name}, tokenizer_cls: {tokenizer_cls}")
+            if any(x in model_name for x in ("deepseek", "deepscaler", "deepcoder")) and "llama" in tokenizer_cls:
+                logger.info(f"Using DeepseekQwenChatTemplateParser for {tokenizer.name_or_path}")
+                return DeepseekQwenChatTemplateParser(tokenizer)
+            elif "qwen" in model_name or "r2e" in model_name or "deepswe" in model_name or "qwen" in tokenizer_cls:
+                logger.info(f"Using QwenChatTemplateParser for {tokenizer.name_or_path}")
+                return QwenChatTemplateParser(tokenizer, processor=processor, disable_thinking=disable_thinking)
+            elif "llama" in model_name:
+                logger.info(f"Using LlamaChatTemplateParser for {tokenizer.name_or_path}")
+                return LlamaChatTemplateParser(tokenizer)
+
+        # Default to the standard parser if no specific match
+        parser = ChatTemplateParser(tokenizer, processor=processor)
+        logger.info(f"No custom parser found. Using default ChatTemplateParser for {tokenizer.name_or_path}")
+        assert parser.verify_equivalence(PARSER_TEST_MESSAGES), "Parser failed equivalence check"
+        return parser
+
+    def tokenize_and_mask(self, messages):
+        try:
+            last_assistant_idx = max(i for i, msg in enumerate(messages) if msg["role"] == "assistant")
+        except ValueError:
+            raise ValueError("No assistant message found in chat_completions") from None
+
+        prompt = self.parse(messages[:last_assistant_idx], is_first_msg=True, add_generation_prompt=True, accumulate_reasoning=False)
+        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+
+        response = self.parse([messages[last_assistant_idx]], is_first_msg=False, add_generation_prompt=False, accumulate_reasoning=True)
+        response = response[len(self.generation_prompt) :].rstrip("\n")  # handle qwen trailing newline from eot token
+        response_ids = self.tokenizer.encode(response, add_special_tokens=False)
+        response_mask = [1] * len(response_ids)
+
+        prompt_ids = torch.tensor(prompt_ids, dtype=torch.long)
+        response_ids = torch.tensor(response_ids, dtype=torch.long)
+        response_mask = torch.tensor(response_mask, dtype=torch.long)
+
+        return prompt_ids, response_ids, response_mask
+
+    def tokenize_and_mask_cumulative(self, messages):
+        response_ids = []
+        response_mask = []
+
+        try:
+            first_assistant_idx = next(i for i, msg in enumerate(messages) if msg["role"] == "assistant")
+        except StopIteration:
+            raise ValueError("No assistant message found in chat_completions") from None
+
+        prompt = self.parse(messages[:first_assistant_idx], is_first_msg=True, add_generation_prompt=True, accumulate_reasoning=False)
+        prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
+
+        for i in range(first_assistant_idx, len(messages)):
+            is_asst = messages[i]["role"] == "assistant"
+            if is_asst:
+                response = self.parse([messages[i]], is_first_msg=False, add_generation_prompt=False, accumulate_reasoning=True)
+                response = response[len(self.generation_prompt) :]
+                ids = self.tokenizer.encode(response, add_special_tokens=False)
+                response_ids.extend(ids)
+                response_mask.extend([1] * len(ids))
+            else:
+                response = self.parse([messages[i]], is_first_msg=False, add_generation_prompt=True, accumulate_reasoning=False)
+                ids = self.tokenizer.encode(response, add_special_tokens=False)
+                response_ids.extend(ids)
+                response_mask.extend([0] * len(ids))
+
+        prompt_ids = torch.tensor(prompt_ids, dtype=torch.long)
+        response_ids = torch.tensor(response_ids, dtype=torch.long)
+        response_mask = torch.tensor(response_mask, dtype=torch.long)
+
+        return prompt_ids, response_ids, response_mask
+
+    def _tokenize_cumulative_multimodal_from_model_output(
+        self, messages, model_output
+    ):
+        """Build the cumulative sequence from the final rollout payload.
+
+        The rollout engine has already fetched and processed every image in
+        the final context.  Reusing its ``prompt_ids``/``multi_modal_inputs``
+        avoids downloading the same URL again while converting the trajectory
+        for update.  Only the response mask is reconstructed from messages.
+        """
+        stored_mask = getattr(model_output, "cumulative_loss_mask", None)
+        if stored_mask is not None:
+            initial = model_output.cumulative_initial_prompt_length
+            ids = torch.cat([
+                torch.as_tensor(model_output.prompt_ids, dtype=torch.long).reshape(-1),
+                torch.as_tensor(model_output.completion_ids, dtype=torch.long).reshape(-1),
+            ])
+            mask = torch.as_tensor(stored_mask, dtype=torch.long)
+            if initial is None or not 0 <= initial <= len(ids) or mask.shape != ids.shape:
+                raise ValueError("Invalid continuous TITO sequence/mask boundary")
+            if mask[:initial].any() or not torch.all((mask == 0) | (mask == 1)):
+                raise ValueError("Invalid continuous TITO loss mask")
+            return ids[:initial], ids[initial:], mask[initial:], dict(model_output.multi_modal_inputs or {})
+        multimodal_inputs = dict(model_output.multi_modal_inputs or {})
+        image_token_id = getattr(self.processor, "image_token_id", None)
+        if image_token_id is None:
+            image_token_id = self.tokenizer.convert_tokens_to_ids("<|image_pad|>")
+
+        image_grid_thw = multimodal_inputs.get("image_grid_thw")
+        feature_counts = []
+        if image_grid_thw is not None:
+            grid = torch.as_tensor(image_grid_thw)
+            if grid.numel():
+                if grid.ndim == 1:
+                    grid = grid.reshape(1, -1)
+                merge_size = int(
+                    getattr(
+                        getattr(self.processor, "image_processor", None),
+                        "merge_size",
+                        1,
+                    )
+                )
+                merge_size = max(merge_size, 1)
+                feature_counts = [
+                    int(t) * (int(h) // merge_size) * (int(w) // merge_size)
+                    for t, h, w in grid[..., :3].tolist()
+                ]
+
+        feature_index = 0
+
+        def declared_image_count(chunk_messages):
+            return sum(
+                len(message.get("images") or [])
+                for message in chunk_messages
+                if isinstance(message, dict)
+            )
+
+        def expand_ids(rendered_text, chunk_messages):
+            raw_ids = self.tokenizer.encode(rendered_text, add_special_tokens=False)
+            logical_count = declared_image_count(chunk_messages)
+            raw_image_count = sum(int(token) == image_token_id for token in raw_ids)
+            if raw_image_count != logical_count:
+                raise ValueError(
+                    "Cumulative multimodal rendering found "
+                    f"{raw_image_count} image tokens for {logical_count} images"
+                )
+
+            nonlocal feature_index
+            expanded = []
+            for token in raw_ids:
+                if int(token) != image_token_id:
+                    expanded.append(int(token))
+                    continue
+                if feature_index >= len(feature_counts):
+                    raise ValueError(
+                        "Cumulative multimodal rendering has more image "
+                        "placeholders than final rollout grid metadata"
+                    )
+                expanded.extend([int(token)] * feature_counts[feature_index])
+                feature_index += 1
+            return torch.tensor(expanded, dtype=torch.long)
+
+        try:
+            first_assistant_idx = next(
+                i for i, msg in enumerate(messages) if msg["role"] == "assistant"
+            )
+            last_assistant_idx = max(
+                i for i, msg in enumerate(messages) if msg["role"] == "assistant"
+            )
+        except (StopIteration, ValueError):
+            raise ValueError("No assistant message found in chat_completions") from None
+
+        prompt_text = self.parse(
+            messages[:first_assistant_idx],
+            is_first_msg=True,
+            add_generation_prompt=True,
+            accumulate_reasoning=False,
+        )
+        prompt_ids = expand_ids(prompt_text, messages[:first_assistant_idx])
+        response_chunks = []
+        response_masks = []
+        reconstructed_final_prompt = [*prompt_ids.tolist()]
+
+        for i in range(first_assistant_idx, len(messages)):
+            is_assistant = messages[i]["role"] == "assistant"
+            if is_assistant:
+                rendered = self.parse(
+                    [messages[i]],
+                    is_first_msg=False,
+                    add_generation_prompt=False,
+                    accumulate_reasoning=True,
+                )
+                rendered = rendered[len(self.generation_prompt) :]
+                if (
+                    i == last_assistant_idx
+                    and getattr(model_output, "completion_ids", None) is not None
+                ):
+                    chunk_ids = torch.as_tensor(
+                        model_output.completion_ids, dtype=torch.long
+                    ).reshape(-1)
+                else:
+                    chunk_ids = expand_ids(rendered, [messages[i]])
+                mask_value = 1
+            else:
+                rendered = self.parse(
+                    [messages[i]],
+                    is_first_msg=False,
+                    add_generation_prompt=True,
+                    accumulate_reasoning=False,
+                )
+                chunk_ids = expand_ids(rendered, [messages[i]])
+                mask_value = 0
+
+            response_chunks.append(chunk_ids)
+            response_masks.append(
+                torch.full((len(chunk_ids),), mask_value, dtype=torch.long)
+            )
+            if not (is_assistant and i == last_assistant_idx):
+                reconstructed_final_prompt.extend(chunk_ids.tolist())
+
+        final_prompt_ids = torch.as_tensor(
+            model_output.prompt_ids, dtype=torch.long
+        ).reshape(-1)
+        reconstructed_final_prompt = torch.tensor(
+            reconstructed_final_prompt, dtype=torch.long
+        )
+        if not torch.equal(reconstructed_final_prompt, final_prompt_ids):
+            raise ValueError(
+                "Cumulative multimodal sequence differs from the final rollout "
+                f"prompt (reconstructed={len(reconstructed_final_prompt)}, "
+                f"rollout={len(final_prompt_ids)})"
+            )
+        if feature_index != len(feature_counts):
+            raise ValueError(
+                "Cumulative multimodal rendering consumed "
+                f"{feature_index} image payloads but final rollout contains "
+                f"{len(feature_counts)}"
+            )
+
+        response_ids = (
+            torch.cat(response_chunks, dim=0)
+            if response_chunks
+            else torch.empty(0, dtype=torch.long)
+        )
+        response_mask = (
+            torch.cat(response_masks, dim=0)
+            if response_masks
+            else torch.empty(0, dtype=torch.long)
+        )
+        return prompt_ids, response_ids, response_mask, multimodal_inputs
+
+    def tokenize_and_mask_cumulative_multimodal(self, messages, model_output=None):
+        """Tokenize a cumulative trajectory with processor-expanded images.
+
+        ``tokenize_and_mask_cumulative`` intentionally predates VLM support:
+        it tokenizes rendered text with the tokenizer and therefore leaves a
+        single logical ``<|image_pad|>`` per image.  This companion method
+        keeps the same prompt/response/mask semantics.  When the final
+        ``ModelOutput`` is supplied, it reuses the already processor-expanded
+        rollout payload and avoids downloading images again.  Without it, the
+        fallback runs every rendered image-containing chunk through the
+        multimodal processor.  The returned payload is ordered exactly like
+        the image placeholders in the returned token sequence.
+
+        Returns:
+            ``(prompt_ids, response_ids, response_mask, multi_modal_inputs)``.
+        """
+        if os.environ.get("RLLM_MM_TITO", "0") == "1" and getattr(model_output, "cumulative_loss_mask", None) is None:
+            raise ValueError("Continuous TITO output missing; refusing legacy history re-tokenization")
+        if model_output is not None and getattr(model_output, "prompt_ids", None) is not None:
+            return self._tokenize_cumulative_multimodal_from_model_output(
+                messages, model_output
+            )
+
+        if self.processor is None:
+            prompt_ids, response_ids, response_mask = self.tokenize_and_mask_cumulative(messages)
+            return prompt_ids, response_ids, response_mask, {}
+
+        try:
+            first_assistant_idx = next(
+                i for i, msg in enumerate(messages) if msg["role"] == "assistant"
+            )
+        except StopIteration:
+            raise ValueError("No assistant message found in chat_completions") from None
+
+        def encode_chunk(rendered_text, chunk_messages):
+            images = self.process_image_data(chunk_messages)
+            if not images:
+                ids = self.tokenizer.encode(rendered_text, add_special_tokens=False)
+                return torch.tensor(ids, dtype=torch.long), {}
+
+            model_inputs = self.processor(
+                text=[rendered_text],
+                images=images,
+                return_tensors="pt",
+            )
+            ids = model_inputs["input_ids"][0]
+            multimodal = {
+                key: value
+                for key, value in model_inputs.items()
+                if key not in {"input_ids", "attention_mask"}
+            }
+            return ids.to(dtype=torch.long), multimodal
+
+        def merge_multimodal(target, source):
+            """Merge processor outputs while preserving image order."""
+            for key, value in source.items():
+                if key not in target:
+                    target[key] = value
+                    continue
+
+                previous = target[key]
+                # Qwen-VL image/video payloads are flattened along dimension 0
+                # and their grid metadata has one row per logical image/video.
+                if key in {
+                    "pixel_values",
+                    "image_grid_thw",
+                    "video_grid_thw",
+                    "second_per_grid_ts",
+                } and hasattr(previous, "shape") and hasattr(value, "shape"):
+                    target[key] = torch.cat([previous, value], dim=0)
+                elif hasattr(previous, "shape") and hasattr(value, "shape"):
+                    # Preserve a future processor field if it is identical;
+                    # otherwise fail instead of silently misaligning it.
+                    if previous.shape != value.shape or not torch.equal(previous, value):
+                        raise ValueError(
+                            f"Cannot merge multimodal processor field {key!r}: "
+                            f"shapes {tuple(previous.shape)} and {tuple(value.shape)} differ"
+                        )
+                elif previous != value:
+                    raise ValueError(
+                        f"Cannot merge multimodal processor field {key!r}: values differ"
+                    )
+
+        prompt_text = self.parse(
+            messages[:first_assistant_idx],
+            is_first_msg=True,
+            add_generation_prompt=True,
+            accumulate_reasoning=False,
+        )
+        prompt_ids, prompt_mm = encode_chunk(
+            prompt_text, messages[:first_assistant_idx]
+        )
+        merged_mm = {}
+        merge_multimodal(merged_mm, prompt_mm)
+
+        response_chunks = []
+        response_masks = []
+        for i in range(first_assistant_idx, len(messages)):
+            is_assistant = messages[i]["role"] == "assistant"
+            if is_assistant:
+                rendered = self.parse(
+                    [messages[i]],
+                    is_first_msg=False,
+                    add_generation_prompt=False,
+                    accumulate_reasoning=True,
+                )
+                rendered = rendered[len(self.generation_prompt) :]
+                chunk_mask_value = 1
+            else:
+                rendered = self.parse(
+                    [messages[i]],
+                    is_first_msg=False,
+                    add_generation_prompt=True,
+                    accumulate_reasoning=False,
+                )
+                chunk_mask_value = 0
+
+            chunk_ids, chunk_mm = encode_chunk(rendered, [messages[i]])
+            response_chunks.append(chunk_ids)
+            response_masks.append(
+                torch.full(
+                    (len(chunk_ids),), chunk_mask_value, dtype=torch.long
+                )
+            )
+            merge_multimodal(merged_mm, chunk_mm)
+
+        response_ids = (
+            torch.cat(response_chunks, dim=0)
+            if response_chunks
+            else torch.empty(0, dtype=torch.long)
+        )
+        response_mask = (
+            torch.cat(response_masks, dim=0)
+            if response_masks
+            else torch.empty(0, dtype=torch.long)
+        )
+        return prompt_ids, response_ids, response_mask, merged_mm
+
+
+class DeepseekQwenChatTemplateParser(ChatTemplateParser):
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+
+        self.bos_token = tokenizer.bos_token
+        self.eos_token = tokenizer.eos_token
+        self.system_token = ""
+        self.user_token = "<｜User｜>"
+        self.assistant_token = "<｜Assistant｜>"
+        self.generation_prompt = self.assistant_token + "<think>\n"
+
+        from rllm.parser.tool_parser import R1ToolParser
+
+        self.tool_parser = R1ToolParser()
+
+    def parse(self, messages: list[dict], add_generation_prompt: bool = False, is_first_msg: bool = False, tools: list[Tool | dict] = None, accumulate_reasoning: bool = False, **kwargs) -> str:
+        tools = tools or []
+        tools_prompt_str = ""
+        if tools:
+            try:
+                tool_schema_strs = []
+                for tool in tools:
+                    if isinstance(tool, Tool):
+                        tool_schema_str = json.dumps(tool.json)
+                    elif isinstance(tool, dict):
+                        tool_schema_str = json.dumps(tool)
+                    else:
+                        tool_schema_str = tool
+                    tool_schema_strs.append(tool_schema_str)
+                tools_schema_str = "\n".join(tool_schema_strs)
+                tools_prompt_str = self.tool_parser.get_tool_prompt(tools_schema_str)
+            except Exception as e:
+                import traceback
+
+                traceback.print_exc()
+                logger.error(f"Failed to format tools: {e}")
+
+        result = ""
+
+        if is_first_msg:
+            result += self.bos_token
+
+        if is_first_msg and messages[0]["role"] != "system" and tools_prompt_str:
+            result += self.system_token + tools_prompt_str
+
+        for message in messages:
+            if message["role"] == "system":
+                result += self.parse_system(message, tools_prompt_str)
+            elif message["role"] == "user":
+                result += self.parse_user(message)
+            elif message["role"] == "assistant":
+                result += self.parse_assistant(message, accumulate_reasoning=accumulate_reasoning)
+            elif message["role"] == "tool":
+                result += self.parse_tool(message)
+            else:
+                raise NotImplementedError(f"Unsupported message role: {message['role']}")
+
+        if add_generation_prompt:
+            result += self.generation_prompt
+        return result
+
+    def parse_system(self, message, tools_prompt_str=""):
+        content = message["content"]
+
+        if "# Tools" not in content and tools_prompt_str:
+            content += tools_prompt_str
+
+        return self.system_token + content
+
+    def parse_user(self, message):
+        return self.user_token + message["content"]
+
+    def parse_assistant(self, message, accumulate_reasoning=False):
+        content = (message.get("content", None) or "").strip()
+        reasoning = (message.get("reasoning", None) or "").strip()
+        tool_calls = message.get("tool_calls", None) or []
+
+        if not accumulate_reasoning:
+            return self.assistant_token + content + self.eos_token
+        elif not reasoning:
+            return self.assistant_token + "<think>\n" + content + self.eos_token
+        else:
+            result = self.assistant_token
+
+            if reasoning and accumulate_reasoning:
+                result += "<think>\n" + reasoning + "\n</think>\n\n"
+
+            if content:
+                result += content
+                if tool_calls:
+                    result += "\n"
+
+            if tool_calls:
+                try:
+                    tool_calls_strs = []
+                    for tool_call in tool_calls:
+                        if isinstance(tool_call, ToolCall):
+                            tool_call_dict = tool_call.to_dict()
+                        elif isinstance(tool_call, dict) and "function" in tool_call:
+                            tool_call_dict = tool_call["function"]
+                        else:
+                            tool_call_dict = tool_call
+                        # Avoid mutating original message structures by parsing into a local variable
+                        arguments_obj = tool_call_dict.get("arguments")
+                        if isinstance(arguments_obj, str):
+                            try:
+                                arguments_obj = json.loads(arguments_obj)
+                            except json.JSONDecodeError:
+                                pass
+                        tool_call_json = f"```json\n{json.dumps(arguments_obj)}\n```"
+                        tool_call_str = f"{self.tool_parser.tool_call_begin}function{self.tool_parser.tool_sep}{tool_call_dict['name']}\n{tool_call_json}\n{self.tool_parser.tool_call_end}"
+                        tool_calls_strs.append(tool_call_str)
+                    joined_calls_str = "\n".join(tool_calls_strs)
+                    tool_calls_str = f"{self.tool_parser.tool_calls_begin}\n{joined_calls_str}\n{self.tool_parser.tool_calls_end}"
+                except Exception as e:
+                    import traceback
+
+                    traceback.print_exc()
+                    logger.error(f"Failed to format tool calls: {e}")
+                    tool_calls_str = ""
+
+                result += tool_calls_str
+
+            result += self.eos_token
+            return result
+
+    def parse_tool(self, message):
+        tool_outputs: list[ToolOutput | dict] = message.get("tool_outputs", [])
+
+        if not tool_outputs:
+            return self.user_token + self.tool_parser.tool_output_begin + "\n" + message["content"] + "\n" + self.tool_parser.tool_output_end
+
+        else:
+            try:
+                tool_outputs_strs = []
+                for tool_output in tool_outputs:
+                    if not isinstance(tool_output, ToolOutput):
+                        tool_output = ToolOutput(**tool_output)
+                    tool_output_str = f"{self.tool_parser.tool_output_begin}\n{str(tool_output)}\n{self.tool_parser.tool_output_end}"
+                    tool_outputs_strs.append(tool_output_str)
+                tool_outputs_str = "\n".join(tool_outputs_strs)
+            except Exception as e:
+                logger.error(f"Failed to format tool outputs: {e}")
+                tool_outputs_str = ""
+
+            return self.user_token + tool_outputs_str
+
+    def parse_completion(self, completion_ids):
+        completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+
+        if completion_text.count("</think>") == 1:
+            reasoning, _, content = completion_text.partition("</think>")
+            if reasoning.startswith("<think>"):
+                reasoning = reasoning[len("<think>") :]
+            if content.endswith(self.eos_token):
+                content = content[: -len(self.eos_token)]
+            reasoning = reasoning.strip()
+            content = content.strip()
+        else:
+            reasoning = None
+            content = completion_text
+            if content.startswith("<think>"):
+                content = content[len("<think>") :]
+            if content.endswith(self.eos_token):
+                content = content[: -len(self.eos_token)]
+            content = content.strip()
+
+        tool_calls = self.tool_parser.parse(completion_text)
+
+        begin_pattern = re.escape(self.tool_parser.tool_call_begin)
+        end_pattern = re.escape(self.tool_parser.tool_call_end)
+        content = re.sub(f"{begin_pattern}.*?{end_pattern}", "", content, flags=re.DOTALL)
+
+        wrapper_begin_pattern = re.escape(self.tool_parser.tool_calls_begin)
+        wrapper_end_pattern = re.escape(self.tool_parser.tool_calls_end)
+        content = re.sub(f"{wrapper_begin_pattern}.*?{wrapper_end_pattern}", "", content, flags=re.DOTALL)
+
+        content = content.strip()
+
+        return {
+            "content": content,
+            "reasoning": reasoning,
+            "tool_calls": tool_calls,
+        }
+
+
+class QwenChatTemplateParser(ChatTemplateParser):
+    def __init__(self, tokenizer, processor=None, disable_thinking=False):
+        super().__init__(tokenizer, processor=processor)
+        self.bos_token = tokenizer.bos_token
+        self.eos_token = tokenizer.eos_token
+        self.thinking_start_token = "<thinking>"
+        self.thinking_end_token = "</thinking>"
+        self.eot_token = "<|im_end|>\n"
+        self.system_token = "<|im_start|>system\n"
+        self.user_token = "<|im_start|>user\n"
+        self.assistant_token = "<|im_start|>assistant\n"
+        if disable_thinking:
+            self.assistant_token += f"{self.thinking_start_token}\n\n{self.thinking_end_token}\n\n"
+        self.generation_prompt = self.assistant_token
+        self.image_token = "<|image_pad|>"
+        self.vision_start_token = "<|vision_start|>"
+        self.vision_end_token = "<|vision_end|>"
+
+        from rllm.parser.tool_parser import QwenToolParser
+
+        self.tool_parser = QwenToolParser()
+
+    def parse(self, messages: list[dict], add_generation_prompt: bool = False, is_first_msg: bool = False, tools: list[Tool] = None, accumulate_reasoning: bool = False, **kwargs) -> str:
+        tools = tools or []
+        try:
+            tools_prompt_str = format_sft_qwen_tool_prompt(tools) if tools else ""
+        except Exception as e:
+            logger.error(f"Failed to format tools: {e}")
+            tools_prompt_str = ""
+
+        result = ""
+
+        # qwen3_vl_nothink has no implicit default system message.  Only add a
+        # system turn here when the caller supplied tools without a system
+        # message, matching Template._encode in LLaMA-Factory.
+        if is_first_msg and messages and messages[0]["role"] != "system" and tools_prompt_str:
+            result += self.system_token + tools_prompt_str + self.eot_token
+
+        for message in messages:
+            if message["role"] == "system":
+                result += self.parse_system(message, tools_prompt_str)
+            elif message["role"] == "user":
+                result += self.parse_user(message)
+            elif message["role"] == "assistant":
+                result += self.parse_assistant(message, accumulate_reasoning=accumulate_reasoning)
+            elif message["role"] == "tool":
+                result += self.parse_tool(message)
+            else:
+                raise NotImplementedError(f"Unsupported message role: {message['role']}")
+
+        if add_generation_prompt:
+            result += self.generation_prompt
+        return result
+
+    def parse_system(self, message, tools_prompt_str=""):
+        content = message["content"]
+
+        if "<tools>" not in content and tools_prompt_str:
+            content += tools_prompt_str
+
+        return self.system_token + content + self.eot_token
+
+    def parse_user(self, message):
+        images = message.get("images")
+        content = str(message.get("content") or "")
+        if images is None:
+            return self.user_token + content + self.eot_token
+
+        assert isinstance(images, list), "images must be a list"
+        n_imgs = len(images)
+        if n_imgs and IMAGE_PLACEHOLDER not in content:
+            # Match SFT's inference fallback when image objects are supplied
+            # separately but the logical message has no placeholder.
+            content = IMAGE_PLACEHOLDER * n_imgs + content
+
+        marker_count = content.count(IMAGE_PLACEHOLDER)
+        if marker_count != n_imgs:
+            raise ValueError(
+                f"Qwen3-VL message has {n_imgs} images but {marker_count} "
+                f"{IMAGE_PLACEHOLDER!r} placeholders."
+            )
+
+        vision_tokens = self.vision_start_token + self.image_token + self.vision_end_token
+        rendered = content.replace(IMAGE_PLACEHOLDER, vision_tokens)
+        return self.user_token + rendered + self.eot_token
+
+    def parse_assistant(self, message, accumulate_reasoning=False):
+        content = (message.get("content", None) or "").strip()
+        reasoning = (message.get("reasoning", None) or "").strip()
+        tool_calls = message.get("tool_calls", None) or []
+
+        if not reasoning and not tool_calls:
+            return self.assistant_token + content + self.eot_token
+
+        else:
+            result = self.assistant_token
+
+            if reasoning and accumulate_reasoning:
+                result += self.thinking_start_token + "\n" + reasoning + "\n" + self.thinking_end_token + "\n\n"
+
+            if content:
+                result += content
+                if tool_calls:
+                    result += "\n"
+
+            if tool_calls:
+                try:
+                    tool_calls_strs = []
+                    for tool_call in tool_calls:
+                        if isinstance(tool_call, ToolCall):
+                            tool_call_dict = tool_call.to_dict()
+                        elif isinstance(tool_call, dict) and "function" in tool_call:
+                            tool_call_dict = tool_call["function"]
+                        else:
+                            tool_call_dict = tool_call
+                        arguments_obj = tool_call_dict.get("arguments")
+                        if isinstance(arguments_obj, str):
+                            try:
+                                arguments_obj = json.loads(arguments_obj)
+                            except json.JSONDecodeError:
+                                pass
+                        tool_call_for_dump = dict(tool_call_dict)
+                        if arguments_obj is not None:
+                            tool_call_for_dump["arguments"] = arguments_obj
+                        tool_call_str = f"{self.tool_parser.tool_call_begin}\n{json.dumps(tool_call_for_dump)}\n{self.tool_parser.tool_call_end}"
+                        tool_calls_strs.append(tool_call_str)
+                    tool_calls_str = "\n".join(tool_calls_strs)
+                except Exception as e:
+                    logger.error(f"Failed to format tool calls: {e}")
+                    tool_calls_str = ""
+
+                result += tool_calls_str
+
+            result += self.eot_token
+            return result
+
+    def parse_tool(self, message):
+        tool_outputs: list[ToolOutput | dict] = message.get("tool_outputs", [])
+
+        if not tool_outputs:
+            return self.user_token + self.tool_parser.tool_output_begin + "\n" + message["content"] + "\n" + self.tool_parser.tool_output_end + self.eot_token
+
+        else:
+            try:
+                tool_outputs_strs = []
+                for tool_output in tool_outputs:
+                    if not isinstance(tool_output, ToolOutput):
+                        tool_output = ToolOutput(**tool_output)
+                    tool_output_str = f"{self.tool_parser.tool_output_begin}\n{str(tool_output)}\n{self.tool_parser.tool_output_end}"
+                    tool_outputs_strs.append(tool_output_str)
+                tool_outputs_str = "\n".join(tool_outputs_strs)
+            except Exception as e:
+                logger.error(f"Failed to format tool outputs: {e}")
+                tool_outputs_str = ""
+
+            return self.user_token + tool_outputs_str + self.eot_token
+
+    def parse_completion(self, completion_ids):
+        completion_text = self.tokenizer.decode(completion_ids, skip_special_tokens=False)
+
+        if completion_text.count(self.thinking_end_token) == 1:
+            reasoning, _, content = completion_text.partition(self.thinking_end_token)
+            if reasoning.startswith(self.thinking_start_token):
+                reasoning = reasoning[len(self.thinking_start_token) :]
+            if content.endswith(self.eos_token):
+                content = content[: -len(self.eos_token)]
+            if content.endswith(self.eot_token):
+                content = content[: -len(self.eot_token)]
+            reasoning = reasoning.strip()
+            content = content.strip()
+        else:
+            reasoning = None
+            content = completion_text
+            if content.startswith(self.thinking_start_token):
+                content = content[len(self.thinking_start_token) :]
+            if content.endswith(self.eos_token):
+                content = content[: -len(self.eos_token)]
+            if content.endswith(self.eot_token):
+                content = content[: -len(self.eot_token)]
+            content = content.strip()
+
+        tool_calls = self.tool_parser.parse(content)
+
+        begin_pattern = re.escape(self.tool_parser.tool_call_begin)
+        end_pattern = re.escape(self.tool_parser.tool_call_end)
+        content = re.sub(f"{begin_pattern}.*?{end_pattern}", "", content, flags=re.DOTALL)
+        content = content.strip()
+
+        return {
+            "content": content,
+            "reasoning": reasoning,
+            "tool_calls": tool_calls,
+        }
+
+    def process_image_data(self, messages):
+        from qwen_vl_utils import fetch_image
+
+        messages = deepcopy(messages)
+        image_data = []
+        for message in messages:
+            if "images" in message and message["images"] is not None:
+                assert isinstance(message["images"], list), "images must be a list"
+                images = message["images"]
+                for image in images:
+                    if image is None:
+                        continue
+                    image_dict = image if isinstance(image, dict) else {"image": image}
+                    processed_image = fetch_image(image_dict, image_patch_size=self.processor.image_processor.patch_size)  # PIL.Image.Image
+                    image_data.append(processed_image)
+        return image_data
+
+
+class LlamaChatTemplateParser(ChatTemplateParser):
+    def __init__(self, tokenizer):
+        super().__init__(tokenizer)
+        self.bos_token = "<|begin_of_text|>"
+        self.system_token = "<|start_header_id|>system<|end_header_id|>\n\n"
+        self.user_token = "<|start_header_id|>user<|end_header_id|>\n\n"
+        self.assistant_token = "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        self.eot_token = "<|eot_id|>"
+        self.generation_prompt = self.assistant_token
+
+        # tool tokens
+        self.tool_start_token = "<|start_header_id|>tool<|end_header_id|>\n\n"
+        self.tool_end_token = "<|eot_id|>"
+        self.tool_response_start_token = "<|start_header_id|>tool_response<|end_header_id|>\n\n"
+        self.tool_response_end_token = "<|eot_id|>"
+
+        # TODO: add tool parser for llama
+
+    def parse(self, messages, add_generation_prompt=False, is_first_msg=False, **kwargs) -> str:
+        result = ""
+
+        if is_first_msg:
+            result += self.bos_token
+
+        for message in messages:
+            if message["role"] == "system":
+                result += self.parse_system(message)
+            elif message["role"] == "user":
+                result += self.parse_user(message)
+            elif message["role"] == "assistant":
+                result += self.parse_assistant(message)
+            elif message["role"] == "tool":
+                result += self.parse_tool(message)
+            else:
+                raise NotImplementedError(f"Unsupported message role: {message['role']}")
+
+        if add_generation_prompt:
+            result += self.generation_prompt
+        return result
+
+    def parse_system(self, message):
+        return self.system_token + message["content"] + self.eot_token
+
+    def parse_user(self, message):
+        return self.user_token + message["content"] + self.eot_token
+
+    def parse_assistant(self, message):
+        return self.assistant_token + message["content"] + self.eot_token
+
+    def parse_tool(self, message):
+        return self.user_token + self.tool_response_start_token + message["content"] + self.tool_response_end_token + self.eot_token
+
+    def parse_completion(self, completion_ids):
+        # TODO: add parse_completion for llama
+        raise NotImplementedError("LLamaChatTemplateParser does not support parse_completion")

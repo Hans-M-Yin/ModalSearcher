@@ -1,0 +1,80 @@
+{
+  "_comment": "Shared public model alias registry for inference tools and evaluation. Configure deployment settings here and load the root .env before running. No live credentials or internal endpoints are included.",
+  "models": {
+    "multimodal_process": {
+      "client_type": "openai",
+      "served_model": "Qwen3-VL-32B",
+      "base_url": "http://127.0.0.1:6658/v1",
+      "api_key": "EMPTY",
+      "timeout_s": 120,
+      "sampling_params": {
+        "greedy": false,
+        "top_p": 0.8,
+        "top_k": 20,
+        "temperature": 0.7,
+        "repetition_penalty": 1.0,
+        "presence_penalty": 1.5,
+        "out_seq_length": 8192
+      }
+    },
+    "gemini35flash_internal_azure": {
+      "client_type": "azure_openai",
+      "served_model": "YOUR_MODEL_OR_DEPLOYMENT_NAME",
+      "api_key": "",
+      "azure_endpoint": "https://your-resource-name.openai.azure.com",
+      "api_version": "2024-03-01-preview",
+      "timeout_s": 120,
+      "sampling_params": {
+        "max_tokens": 32768,
+        "thinking": {
+          "include_thoughts": true,
+          "budget_tokens": 8192
+        }
+      }
+    },
+    "gpt54_internal_azure": {
+      "client_type": "azure_openai",
+      "served_model": "YOUR_MODEL_OR_DEPLOYMENT_NAME",
+      "api_key": "",
+      "azure_endpoint": "https://your-resource-name.openai.azure.com",
+      "api_version": "2024-03-01-preview",
+      "timeout_s": 120,
+      "sampling_params": {
+        "max_tokens": 1024,
+        "reasoning_effort": "medium"
+      }
+    },
+    "gpt5": {
+      "client_type": "openai",
+      "served_model": "YOUR_MODEL_OR_DEPLOYMENT_NAME",
+      "api_key": "",
+      "base_url": "https://your-openai-compatible-endpoint.example/v1",
+      "timeout_s": 120
+    },
+    "gemini25pro_internal_azure": {
+      "client_type": "azure_openai",
+      "served_model": "YOUR_MODEL_OR_DEPLOYMENT_NAME",
+      "api_key": "",
+      "azure_endpoint": "https://your-resource-name.openai.azure.com",
+      "api_version": "2024-03-01-preview",
+      "timeout_s": 120,
+      "sampling_params": {
+        "max_tokens": 12000,
+        "thinking": {
+          "include_thoughts": true,
+          "budget_tokens": 8192
+        }
+      }
+    },
+    "gpt4o": {
+      "client_type": "openai",
+      "served_model": "gpt-4o",
+      "base_url": "https://api.openai.com/v1",
+      "api_key": "",
+      "timeout_s": 120,
+      "sampling_params": {
+        "max_tokens": 1024
+      }
+    }
+  }
+}

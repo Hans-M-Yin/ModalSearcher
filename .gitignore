@@ -1,0 +1,181 @@
+# --- macOS / editor cruft ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+.Python
+
+# --- Virtual envs ---
+.env
+.env.local
+.env.*.local
+.venv/
+venv/
+env/
+ENV/
+
+# Public fill-in configuration at the repository root.
+!/.env
+
+# --- Test / type checking caches ---
+.pytest_cache/
+.mypy_cache/
+.pyre/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+
+# --- Local data / model artifacts (do NOT ship into the repo) ---
+checkpoints/
+ckpts/
+RL/rollouts/
+runs/
+wandb/
+outputs/
+logs/
+*.log
+*.pid
+*_log
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+
+# Downloaded local embedding checkpoint (managed by utils/download_qwen3_embedding.sh)
+/models/Qwen3-Embedding-0.6B/
+
+# --- IDE / OS ---
+*.bak
+*.tmp
+*.orig
+opensearch_vl/vdr_testmini_for_opensearch.parquet
+SFT/data
+
+# --- Private overrides for the public model alias configuration ---
+/synthesis/models.local.json
+/synthesis/models.*.local.json
+runs
+serper_openserp_adapter_log
+openserp_log
+openserp.pid
+serper_openserp_adapter.pid
+vllm_reader_lm_log
+vllm_reader_lm.pid
+enhanced_reader_log
+enhanced_reader.pid
+synthesis/.image_cache
+synthesis/ignore/
+synthesis/.ignore/
+synthesis/.serper_pool_state.json
+synthesis/.serper_pool_state.json.lock
+synthesis/firecrawl_keys.txt
+synthesis/firecrawl_state.json
+synthesis/firecrawl_state.json.lock
+/data/
+/opensearch_infer/
+
+# --- Local debugging / verification runtime artifacts ---
+/--results-jsonl
+/debug/image_download_resolver_cache/
+/debug/image_download_resolver_report.json
+/verification_sample_*.json
+
+# --- Experiment artifacts and visual outputs ---
+RL/rollouts_saved/
+RL/.env_remote
+*.out
+debug/partial_credit_*.json
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tif
+*.tiff
+*.ico
+
+# Public project logo; unpublished paper figures remain excluded.
+!/images/logo.png
+/main.pdf
+
+# --- Large local directories (prune before traversing on HDFS) ---
+/models/
+/saves/
+/Qwen3-VL-8B-ablation/
+/Qwen3-VL-8B-SFT13_5-RL5-step110-ablation/
+/agent/
+/opensearch_vl/data/
+/reader_workers/
+/reader_worker_pids/
+/debug/wandb_partial_reshaping/
+saves/
+.cache/
+.image_cache/
+remote_worker/
+
+# --- Local assistant configuration and credentials ---
+/.release-private/
+/.agents/
+/.codex/
+/.codex_artifacts/
+/.aws/
+.lark_env
+.env_remote
+.env.*.local
+serper_keys.txt
+*_keys.txt
+/synthesis/serper_keys.txt.example
+
+# --- Generated datasets, model state and archives ---
+*.parquet
+*.arrow
+*.jsonl
+*.jsonl.gz
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.pth
+*.onnx
+*.gguf
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# --- Runtime files and accidental command-line outputs ---
+/logs.txt
+/image
+/--api-timeout
+/--model-alias
+/--workdir
+*_timing_log
+/utils/reader_backend_registry.txt

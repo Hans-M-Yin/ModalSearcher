@@ -1,0 +1,7 @@
+# Install the matching CUDA-enabled torch/torchvision wheels first.
+-r requirements-inference.txt
+torch==2.8.0
+torchvision==0.23.0
+transformers==4.57.1
+accelerate
+qwen-vl-utils

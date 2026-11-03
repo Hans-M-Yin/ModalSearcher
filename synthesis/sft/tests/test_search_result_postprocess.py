@@ -1,0 +1,198 @@
+import unittest
+from unittest.mock import patch
+
+from synthesis.sft.api_tools import ToolRuntimeContext, execute_tool_call
+from synthesis.sft.tools import postprocess_search_output
+
+
+class SearchResultPostprocessTests(unittest.TestCase):
+    def _fake_keywords(self, url: str, *, model_alias: str = "multimodal_process") -> str:
+        del model_alias
+        return "hint" if "example" in url else ""
+
+    def test_t2i_hides_urls_and_registers_page_and_image_resources(self) -> None:
+        raw = {
+            "ok": True,
+            "query": "example query",
+            "results": [
+                {
+                    "title": "Example photo",
+                    "image_url": "https://img.example/photo.jpg",
+                    "thumbnail_url": "https://thumb.example/photo.jpg",
+                    "source_page_url": "https://page.example/story",
+                    "snippet": "Example snippet",
+                    "rank": 1,
+                }
+            ],
+        }
+        with patch("synthesis.sft.tools.extract_url_semantic_keywords", self._fake_keywords):
+            compact, resources = postprocess_search_output(tool_name="t2i_search", output=raw)
+
+        item = compact["results"][0]
+        self.assertNotIn("result_id", item)
+        self.assertNotIn("rank", item)
+        self.assertNotIn("image_url", item)
+        self.assertNotIn("thumbnail_url", item)
+        self.assertNotIn("source_page_url", item)
+        self.assertTrue(item["image_id"].startswith("image_"))
+        self.assertTrue(item["source_page_id"].startswith("page_"))
+        image = next(resource for resource in resources if resource.kind == "image")
+        self.assertEqual(image.fallback_urls, ["https://thumb.example/photo.jpg"])
+
+    def test_resource_id_read_uses_registered_primary_url(self) -> None:
+        context = ToolRuntimeContext(working_dir="/tmp/sft_resource_test")
+        raw = {
+            "ok": True,
+            "query": "example",
+            "results": [{"title": "Example", "url": "https://page.example/story", "snippet": "x", "rank": 1}],
+        }
+        with patch("synthesis.sft.tools.extract_url_semantic_keywords", self._fake_keywords):
+            compact = context.postprocess_search_output("t2t_search", raw)
+        resource_id = compact["results"][0]["source_page_id"]
+
+        with patch(
+            "synthesis.sft.api_tools.tools.read_url",
+            return_value={
+                "ok": True,
+                "kind": "text",
+                "url": "https://redirect.example/private",
+                "title": "Example page",
+                "content": "Relevant evidence",
+                "firecrawl_metadata": {"url": "https://redirect.example/private"},
+            },
+        ) as read:
+            result = execute_tool_call(
+                "read_url",
+                {"resource_id": resource_id, "goal": "inspect"},
+                context,
+            )
+        self.assertEqual(
+            result.output,
+            {
+                "page_id": resource_id,
+                "title": "Example page",
+                "goal": "inspect",
+                "content": "Relevant evidence",
+            },
+        )
+        self.assertNotIn("url", result.output_text)
+        self.assertNotIn("firecrawl_metadata", result.output)
+        self.assertEqual(read.call_args.kwargs["url"], "https://page.example/story")
+
+    def test_url_field_compact_resource_id_uses_registered_primary_url(self) -> None:
+        context = ToolRuntimeContext(working_dir="/tmp/sft_resource_test")
+        raw = {
+            "ok": True,
+            "query": "example query",
+            "results": [{"title": "Example", "url": "https://page.example/story", "rank": 1}],
+        }
+        with patch("synthesis.sft.tools.extract_url_semantic_keywords", self._fake_keywords):
+            compact = context.postprocess_search_output("t2t_search", raw)
+        resource_id = compact["results"][0]["source_page_id"]
+
+        with patch(
+            "synthesis.sft.api_tools.tools.read_url",
+            return_value={"ok": True, "kind": "text", "title": "Example", "content": "Evidence"},
+        ) as read:
+            result = execute_tool_call("read_url", {"url": resource_id}, context)
+
+        self.assertEqual(result.output["title"], "Example")
+        self.assertEqual(read.call_args.kwargs["url"], "https://page.example/story")
+
+    def test_i2i_compact_output_omits_query_fields(self) -> None:
+        raw = {
+            "ok": True,
+            "top_k": 1,
+            "matches": [{"title": "Example", "source": "Example", "link": "https://page.example/x", "imageUrl": "https://img.example/x.jpg"}],
+        }
+        with patch("synthesis.sft.tools.extract_url_semantic_keywords", self._fake_keywords):
+            compact, _resources = postprocess_search_output(tool_name="i2i_search", output=raw)
+        self.assertNotIn("query", compact)
+        self.assertNotIn("query_image", compact)
+        item = compact["results"][0]
+        self.assertIn("image_id", item)
+        self.assertIn("source_page_id", item)
+        self.assertLess(list(item).index("image_id"), list(item).index("source_page_id"))
+
+    def test_keyword_extraction_submits_every_unique_page_and_image_url(self) -> None:
+        raw = {
+            "ok": True,
+            "query": "example",
+            "results": [
+                {"title": "One", "url": "https://page.example/one"},
+                {"title": "Two", "url": "https://page.example/two"},
+            ],
+        }
+        calls: list[str] = []
+
+        def keyword_extractor(url: str, *, model_alias: str = "multimodal_process") -> str:
+            del model_alias
+            calls.append(url)
+            return ""
+
+        with patch("synthesis.sft.tools.extract_url_semantic_keywords", keyword_extractor):
+            postprocess_search_output(tool_name="t2t_search", output=raw)
+
+        self.assertCountEqual(calls, ["https://page.example/one", "https://page.example/two"])
+
+    def test_unknown_resource_id_does_not_attempt_direct_read(self) -> None:
+        context = ToolRuntimeContext(working_dir="/tmp/sft_resource_test")
+        result = execute_tool_call("read_url", {"resource_id": "page_deadbeef"}, context)
+        self.assertEqual(
+            result.output,
+            {
+                "page_id": "page_deadbeef",
+                "title": "",
+                "goal": "",
+                "content": "Unable to read the requested page.",
+            },
+        )
+
+    def test_legacy_url_still_reads_directly_when_not_registered(self) -> None:
+        context = ToolRuntimeContext(working_dir="/tmp/sft_resource_test")
+        with patch(
+            "synthesis.sft.api_tools.tools.read_url",
+            return_value={"ok": True, "kind": "text", "title": "Direct", "content": "Text"},
+        ) as read:
+            result = execute_tool_call("read_url", {"url": "https://unknown.example/page"}, context)
+        self.assertEqual(set(result.output), {"page_id", "title", "goal", "content"})
+        self.assertTrue(result.output["page_id"].startswith("page_"))
+        self.assertNotIn("unknown.example", result.output_text)
+        self.assertEqual(read.call_args.kwargs["url"], "https://unknown.example/page")
+
+    def test_optional_tool_cache_is_used_only_when_injected(self) -> None:
+        class FakeCache:
+            def __init__(self):
+                self.values = {}
+
+            def get_or_compute(self, tool_name, arguments, compute):
+                key = (tool_name, tuple(sorted(arguments.items())))
+                if key not in self.values:
+                    self.values[key] = compute()
+                return self.values[key]
+
+        context = ToolRuntimeContext(working_dir="/tmp/sft_resource_test")
+        cache = FakeCache()
+        raw = {"ok": True, "query": "example", "results": []}
+        with (
+            patch("synthesis.sft.api_tools.tools.t2t_search", return_value=raw) as search,
+            patch.object(ToolRuntimeContext, "postprocess_search_output", return_value=raw),
+        ):
+            execute_tool_call(
+                "t2t_search",
+                {"query": "example"},
+                context,
+                tool_cache=cache,
+            )
+            execute_tool_call(
+                "t2t_search",
+                {"query": "example"},
+                context,
+                tool_cache=cache,
+            )
+
+        search.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

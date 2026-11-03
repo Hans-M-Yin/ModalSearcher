@@ -1,0 +1,4 @@
+# Optional file-format and legacy image-enhancement support.
+cairosvg
+pymupdf
+opencv-python-headless

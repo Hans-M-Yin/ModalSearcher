@@ -1,0 +1,13 @@
+# API inference client, evaluation, and shared tool clients.
+# GPU model loading and training frameworks are deliberately separate.
+numpy
+pillow
+pandas
+pyarrow
+requests
+httpx
+openai
+tqdm
+huggingface_hub>=0.34,<1
+firecrawl>=4.34.0,<5
+oss2

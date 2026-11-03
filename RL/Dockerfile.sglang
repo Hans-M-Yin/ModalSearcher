@@ -1,0 +1,141 @@
+# syntax=docker/dockerfile:1
+
+# Public CUDA 12.8 / PyTorch 2.8.0 environment with compiled GPU extensions.
+ARG BASE_IMAGE=verlai/verl:base-verl0.6-cu128-cudnn9.8-torch2.8.0-fa2.7.4
+FROM ${BASE_IMAGE}
+
+ARG PROJECT_ROOT=/workspace/project
+ENV PROJECT_ROOT=${PROJECT_ROOT}
+ARG PIP_INDEX=https://pypi.org/simple
+
+# Install the repository-local verl 0.6.1 source without replacing the GPU stack.
+ARG INSTALL_LOCAL_VERL=1
+
+# vLLM and SGLang have incompatible outlines-core requirements. Build one
+# backend per image; override with --build-arg ROLLOUT_BACKEND=vllm if needed.
+ARG ROLLOUT_BACKEND=sglang
+ARG VLLM_VERSION=0.11.0
+ARG SGLANG_VERSION=0.5.5
+
+# The base image should already contain transformer-engine and flash-attn.
+# Set this to 1 only when they are missing from the base image and the image has
+# a compatible CUDA compiler/toolchain.
+ARG INSTALL_GPU_EXTENSIONS=0
+
+ENV ROLLOUT_NAME=${ROLLOUT_BACKEND} \
+    DEBIAN_FRONTEND=noninteractive \
+    PIP_ROOT_USER_ACTION=ignore \
+    PYTHONUNBUFFERED=1 \
+    MAX_JOBS=16 \
+    FLASH_ATTENTION_FORCE_BUILD=TRUE \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    TOKENIZERS_PARALLELISM=false
+
+SHELL ["/bin/bash", "-c"]
+WORKDIR /workspace
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends git ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip config set global.index-url "${PIP_INDEX}" && \
+    pip config set global.extra-index-url "${PIP_INDEX}" && \
+    pip install --no-cache-dir packaging wheel "setuptools>=77.0.3,<80" editables
+
+# Keep the public base's compiled extensions and CUDA-enabled torch wheel.
+RUN python - <<'PY'
+import importlib.metadata as md
+import torch
+
+assert torch.__version__.split("+", 1)[0] == "2.8.0", torch.__version__
+assert torch.version.cuda == "12.8", torch.version.cuda
+constraints = [
+    "torchvision==0.23.0",
+    "torchaudio==2.8.0",
+    "transformers==4.57.1",
+    "ray>=2.48.0,<3",
+]
+for name in ("torch", "flash-attn", "transformer-engine"):
+    try:
+        constraints.append(f"{name}=={md.version(name)}")
+    except md.PackageNotFoundError:
+        pass
+with open("/tmp/base-constraints.txt", "w") as handle:
+    handle.write("\n".join(constraints) + "\n")
+PY
+
+ENV PIP_CONSTRAINT=/tmp/base-constraints.txt
+
+RUN pip install --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/cu128 \
+    "torchvision==0.23.0" "torchaudio==2.8.0"
+
+# Build from the repository root using the current public-release checkout:
+#   docker build -f RL/Dockerfile.sglang -t opensearch-vl:sglang .
+# Check out the desired revision before building. The root .dockerignore
+# excludes private configuration, datasets, model weights, and run artifacts.
+COPY . ${PROJECT_ROOT}/
+
+WORKDIR ${PROJECT_ROOT}/RL/rllm
+
+# Install the repository copies in editable mode, but keep dependency
+# resolution disabled so pip cannot replace the base image's GPU stack.
+RUN if [[ "${INSTALL_LOCAL_VERL}" == "1" ]]; then \
+        pip install --no-cache-dir --no-build-isolation --no-deps -e ./verl; \
+    fi && \
+    pip install --no-cache-dir --no-build-isolation --no-deps -e .
+
+WORKDIR ${PROJECT_ROOT}/RL/Megatron-LM
+RUN pip install --no-cache-dir --no-build-isolation --no-deps -e .
+
+WORKDIR ${PROJECT_ROOT}/RL/mbridge
+RUN pip install --no-cache-dir --no-build-isolation --no-deps -e .
+
+# Install the selected backend, official Ray, and shared Python dependencies.
+RUN case "${ROLLOUT_BACKEND}" in \
+        vllm) set -- "vllm==${VLLM_VERSION}" ;; \
+        sglang) set -- "sglang==${SGLANG_VERSION}" ;; \
+        *) echo "ROLLOUT_BACKEND must be vllm or sglang" >&2; exit 1 ;; \
+    esac && \
+    pip install --no-cache-dir --upgrade-strategy only-if-needed \
+    "$@" "ray[default]>=2.48.0,<3" \
+    "transformers>=4.55.0" \
+    "datasets>=2.20.0" \
+    accelerate codetiming dill hydra-core omegaconf \
+    "numpy<2.0.0" pandas polars pillow \
+    "pyarrow>=19.0.0" pybind11 pylatexenc peft \
+    "tensordict>=0.8.0,<=0.10.0,!=0.9.0" torchdata \
+    wandb tensorboard packaging \
+    mcp eval-protocol openai fastapi uvicorn tqdm PyYAML pydantic \
+    wrapt "asgiref>=3.7.0" json5 aiosqlite oss2 "firecrawl>=4.34.0,<5" \
+    "requests==2.32.3" huggingface_hub \
+    qwen-vl-utils av decord safetensors einops pymupdf
+
+# Optional fallback for a base image that does not contain the GPU extensions.
+# Building flash-attn can take a long time and requires a matching CUDA toolchain.
+RUN if [[ "${INSTALL_GPU_EXTENSIONS}" == "1" ]]; then \
+        pip install --no-cache-dir --no-build-isolation transformer_engine flash-attn; \
+    fi
+
+ENV PYTHONPATH=${PROJECT_ROOT}:${PROJECT_ROOT}/RL/rllm:${PROJECT_ROOT}/RL/Megatron-LM:${PROJECT_ROOT}/RL/mbridge:${PYTHONPATH}
+WORKDIR ${PROJECT_ROOT}/RL/rllm
+
+# Validate package versions without requiring GPU access during docker build.
+RUN python - <<'PY'
+import importlib
+import importlib.metadata as md
+import os
+import torch
+
+assert torch.__version__.split("+", 1)[0] == "2.8.0", torch.__version__
+assert torch.version.cuda == "12.8", torch.version.cuda
+assert md.version("verl") == "0.6.1", md.version("verl")
+backend = os.environ["ROLLOUT_NAME"]
+for name in ("rllm", "verl", "mbridge", "torchvision", "torchaudio", "ray", backend):
+    importlib.import_module(name)
+print({name: md.version(name) for name in ("torch", "verl", "ray", backend)})
+print("torch.cuda:", torch.version.cuda)
+print("RL imports: OK")
+PY
+
+CMD ["/bin/bash"]

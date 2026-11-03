@@ -1,0 +1,5 @@
+# Optional Enhanced Reader / Reader dispatcher service dependencies.
+# HTTP Relay itself uses only the Python standard library.
+fastapi
+httpx
+uvicorn

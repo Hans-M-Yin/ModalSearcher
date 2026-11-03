@@ -1,0 +1,4 @@
+# Serve ModalSearcher checkpoints and the auxiliary tool model with SGLang.
+# Install the CUDA 12.8 PyTorch wheels before this file.
+-r requirements-inference-local.txt
+sglang==0.5.5
