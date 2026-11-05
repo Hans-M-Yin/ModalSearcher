@@ -3,7 +3,7 @@
   <h1>ModalSearcher</h1>
   <p><b>将视觉证据融入自主跨模态深度搜索</b></p>
 
-  [![arXiv: coming soon](https://img.shields.io/badge/arXiv-coming%20soon-b31b1b?style=for-the-badge)](https://arxiv.org/abs/ARXIV_ID)
+  [![arXiv](https://img.shields.io/badge/arXiv-2611.06131-b31b1b?style=for-the-badge))](http://arxiv.org/abs/2611.06131)
   [![Code](https://img.shields.io/badge/GitHub-ModalSearcher-181717?style=for-the-badge)](https://github.com/Hans-M-Yin/ModalSearcher)
   [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
