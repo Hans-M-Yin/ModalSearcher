@@ -15,6 +15,7 @@
 
 ## Contents
 
+- [Open-Source Roadmap](#open-source-roadmap)
 - [🔍 Overview](#overview)
 - [🛠️ Setup](#setup)
   - [1. Tool setup](#1-tool-setup)
@@ -26,6 +27,15 @@
   - [LLM-as-judge](#llm-as-judge)
   - [Outputs and reports](#outputs-and-reports)
 - [🤝 Acknowledgements and licenses](#acknowledgements-and-licenses)
+
+## Open-Source Roadmap
+
+- [x] Full training and inference code
+- [x] SFT-only model weights
+- [x] Full model weights (SFT + RL)
+- [ ] Data synthesis code
+- [ ] ModalSearch-Benchmark
+- [ ] ModalSearch-Training
 
 <a id="overview"></a>
 

@@ -15,6 +15,7 @@
 
 ## 目录
 
+- [开源计划](#开源计划)
 - [Overview](#overview)
 - [Setup](#setup)
   - [1. 工具配置](#1-工具配置)
@@ -26,6 +27,15 @@
   - [LLM-as-judge](#llm-as-judge)
   - [输出结果与报告](#输出结果与报告)
 - [致谢与许可证](#致谢与许可证)
+
+## 开源计划
+
+- [x] 完整训练推理代码
+- [x] SFT-only 模型权重
+- [x] 完整模型权重（SFT + RL）
+- [ ] 数据合成代码
+- [ ] ModalSearch-Benchmark
+- [ ] ModalSearch-Training
 
 ## Overview
 
